@@ -10,6 +10,9 @@ from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 from math import sqrt
 from scipy.optimize import linear_sum_assignment
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'SimHei', 'Droid Sans Fallback', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
+
 
 def read_paths_from_file(paths_file):
     """
@@ -341,117 +344,34 @@ def run_eecbs(map_file, scen_file, output_csv, output_paths, num_agents, time_li
         return None
 
 
+
 class BipartiteGNNLayer(MessagePassing):
-    def __init__(self, robot_dim, task_dim, edge_dim, hidden_dim, leaky_relu_neg_slope=0.1):
+    def __init__(self, robot_dim, task_dim, edge_dim, hidden_dim):
         """
-        二分图GNN层（使用LeakyReLU激活函数）
+        二分图GNN层，用于处理机器人和任务之间的消息传递
         
         参数:
         - robot_dim: 机器人节点特征维度
         - task_dim: 任务节点特征维度
         - edge_dim: 边特征维度
         - hidden_dim: 隐藏层维度
-        - leaky_relu_neg_slope: LeakyReLU的负斜率参数
         """
         super(BipartiteGNNLayer, self).__init__(aggr='add')
         
-        # 定义消息函数 f_θe（使用LeakyReLU）
-        self.f_theta_e = torch.nn.Sequential(
+        # 消息函数
+        self.f_phi_e = torch.nn.Sequential(
             torch.nn.Linear(robot_dim + task_dim + edge_dim, hidden_dim),
-            torch.nn.LeakyReLU(negative_slope=leaky_relu_neg_slope),  # 替换为LeakyReLU
+            torch.nn.ReLU(),
             torch.nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # 定义节点更新函数 f_θv（使用LeakyReLU）
-        self.f_theta_v = torch.nn.Sequential(
+        # 节点更新函数
+        self.f_phi_v = torch.nn.Sequential(
             torch.nn.Linear(robot_dim + hidden_dim, hidden_dim),
-            torch.nn.LeakyReLU(negative_slope=leaky_relu_neg_slope),  # 替换为LeakyReLU
+            torch.nn.ReLU(),
             torch.nn.Linear(hidden_dim, hidden_dim)
         )
         
-        self.leaky_relu = torch.nn.LeakyReLU(negative_slope=leaky_relu_neg_slope)  # 可复用的激活函数
-        
-    def forward(self, x_robot, x_task, edge_index, edge_attr):
-        x = torch.cat([x_robot, x_task], dim=0)
-        aggregated_messages = self.get_aggregated_messages(x_robot, x_task, edge_index, edge_attr)
-        updated_robots = self.update_robots(x_robot, aggregated_messages)
-        return updated_robots, x_task
-    
-    def get_aggregated_messages(self, x_robot, x_task, edge_index, edge_attr):
-        x = torch.cat([x_robot, x_task], dim=0)
-        robot_indices = edge_index[0]
-        task_indices = edge_index[1] + x_robot.size(0)
-        adjusted_edge_index = torch.stack([robot_indices, task_indices], dim=0)
-        return self.propagate(adjusted_edge_index, x=x, edge_attr=edge_attr, size=(x.size(0), x.size(0)))
-    
-    def update_robots(self, x_robot, aggregated_messages):
-        robot_messages = aggregated_messages[:x_robot.size(0)]
-        update_input = torch.cat([robot_messages, x_robot], dim=1)
-        return self.f_theta_v(update_input)  # 自动应用LeakyReLU
-    
-    def message(self, x_i, x_j, edge_attr):
-        msg = torch.cat([x_i, x_j, edge_attr], dim=1)
-        return self.f_theta_e(msg)  # 自动应用LeakyReLU
-    
-    # 保留update方法（尽管未使用）
-    def update(self, aggr_out, x):
-        return aggr_out
-
-class TaskSelectionMLP(torch.nn.Module):
-    def __init__(self, robot_hidden_dim, task_dim, num_tasks, mlp_hidden=128):
-        super(TaskSelectionMLP, self).__init__()
-        self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(robot_hidden_dim + task_dim, mlp_hidden),
-            torch.nn.LeakyReLU(negative_slope=0.1),
-            torch.nn.Dropout(0.2),
-            torch.nn.Linear(mlp_hidden, 1)  # 输出每个机器人-任务对的一个分数
-        )
-
-    def forward(self, robot_features, task_features):
-        N, H = robot_features.shape  # N = 机器人数量
-        M, D = task_features.shape   # M = 任务数量
-        
-        # 扩展维度并拼接特征
-        robot_expanded = robot_features.unsqueeze(1).expand(-1, M, -1)  # [N, M, H]
-        task_expanded = task_features.unsqueeze(0).expand(N, -1, -1)    # [N, M, D]
-        combined = torch.cat([robot_expanded, task_expanded], dim=2)   # [N, M, H+D]
-        
-        # 通过MLP计算每个机器人-任务对的分数
-        scores = self.mlp(combined.reshape(-1, H + D))  # [N*M, 1]
-        
-        # 重塑为 [N, M] 并应用softmax
-        scores = scores.reshape(N, M)  # [N, M]
-        task_probs = F.softmax(scores, dim=1)  # 对每个机器人的任务分数进行归一化
-        
-        return task_probs
-     
-class RobotTaskPolicy(torch.nn.Module):
-    def __init__(self, robot_dim, task_dim, edge_dim, gnn_hidden, mlp_hidden, num_tasks):
-        """
-        机器人任务分配策略模型
-        
-        参数:
-        - robot_dim: 机器人特征维度
-        - task_dim: 任务特征维度
-        - edge_dim: 边特征维度
-        - gnn_hidden: GNN隐藏层维度
-        - mlp_hidden: MLP隐藏层维度
-        - num_tasks: 任务数量
-        """
-        super(RobotTaskPolicy, self).__init__()
-        self.gnn = BipartiteGNNLayer(
-            robot_dim=robot_dim,
-            task_dim=task_dim,
-            edge_dim=edge_dim,
-            hidden_dim=gnn_hidden
-        )
-        self.task_selector = TaskSelectionMLP(
-            robot_hidden_dim=gnn_hidden,
-            task_dim=task_dim,
-            num_tasks=num_tasks,
-            mlp_hidden=mlp_hidden
-        )
-
     def forward(self, x_robot, x_task, edge_index, edge_attr):
         """
         前向传播
@@ -463,56 +383,164 @@ class RobotTaskPolicy(torch.nn.Module):
         - edge_attr: 边特征 [num_edges, edge_dim]
         
         返回:
-        - task_probs: 任务选择概率 [num_robots, num_tasks]
+        - updated_robots: 更新后的机器人特征 [num_robots, hidden_dim]
+        - x_task: 任务特征保持不变 [num_tasks, task_dim]
         """
-        robot_hidden, _ = self.gnn(x_robot, x_task, edge_index, edge_attr)
-        return self.task_selector(robot_hidden, x_task)
+        x = torch.cat([x_robot, x_task], dim=0)
+        # 获取聚合消息
+        robot_indices = edge_index[0]
+        task_indices = edge_index[1] + x_robot.size(0)
+        edge_index_adj = torch.stack([robot_indices, task_indices], dim=0)
+        
+        out = self.propagate(edge_index_adj, x=x, edge_attr=edge_attr, size=(x.size(0), x.size(0)))
+        
+        # 仅更新机器人节点
+        robot_messages = out[:x_robot.size(0)]
+        robot_update_input = torch.cat([robot_messages, x_robot], dim=1)
+        updated_robots = self.f_phi_v(robot_update_input)
+        
+        return updated_robots, x_task
+    
+    def message(self, x_i, x_j, edge_attr):
+        """
+        定义消息函数
+        
+        参数:
+        - x_i: 源节点特征
+        - x_j: 目标节点特征
+        - edge_attr: 边特征
+        
+        返回:
+        - msg: 消息 [num_edges, hidden_dim]
+        """
+        # 组合源节点、目标节点和边特征
+        msg_input = torch.cat([x_i, x_j, edge_attr], dim=1)
+        return self.f_phi_e(msg_input)
+
+class EnhancedBipartiteGNNLayer(MessagePassing):
+    def __init__(self, robot_dim, task_dim, edge_dim, hidden_dim, dropout=0.0):
+        super(EnhancedBipartiteGNNLayer, self).__init__(aggr='add')
+        self.f_theta_e = torch.nn.Sequential(
+            torch.nn.Linear(robot_dim + task_dim + edge_dim, hidden_dim),
+            torch.nn.LeakyReLU(negative_slope=0.1),
+            torch.nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.f_theta_v = torch.nn.Sequential(
+            torch.nn.Linear(robot_dim + hidden_dim, hidden_dim),
+            torch.nn.LeakyReLU(negative_slope=0.1),
+            torch.nn.Linear(hidden_dim, hidden_dim)
+        )
+    def forward(self, x_robot, x_task, edge_index, edge_attr):
+        x = torch.cat([x_robot, x_task], dim=0)
+        aggregated_messages = self.get_aggregated_messages(x_robot, x_task, edge_index, edge_attr)
+        updated_robots = self.update_robots(x_robot, aggregated_messages)
+        return updated_robots, x_task
+    def get_aggregated_messages(self, x_robot, x_task, edge_index, edge_attr):
+        x = torch.cat([x_robot, x_task], dim=0)
+        robot_indices = edge_index[0]
+        task_indices = edge_index[1] + x_robot.size(0)
+        adjusted_edge_index = torch.stack([robot_indices, task_indices], dim=0)
+        return self.propagate(adjusted_edge_index, x=x, edge_attr=edge_attr, size=(x.size(0), x.size(0)))
+    def update_robots(self, x_robot, aggregated_messages):
+        robot_messages = aggregated_messages[:x_robot.size(0)]
+        update_input = torch.cat([robot_messages, x_robot], dim=1)
+        return self.f_theta_v(update_input)
+    def message(self, x_i, x_j, edge_attr):
+        msg = torch.cat([x_i, x_j, edge_attr], dim=1)
+        return self.f_theta_e(msg)
+
+class TaskSelectionMLP(torch.nn.Module):
+    def __init__(self, robot_hidden_dim, task_dim, num_tasks, mlp_hidden=128, temperature=1.0, num_episodes=1000):
+        super(TaskSelectionMLP, self).__init__()
+        self.temperature = temperature
+        self.num_episodes = num_episodes
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(robot_hidden_dim + task_dim, mlp_hidden),
+            torch.nn.LeakyReLU(negative_slope=0.1),
+            torch.nn.Linear(mlp_hidden, 1)
+        )
+    def forward(self, robot_features, task_features, c_episode=None):
+        N, H = robot_features.shape
+        M, D = task_features.shape
+        robot_expanded = robot_features.unsqueeze(1).expand(-1, M, -1)
+        task_expanded = task_features.unsqueeze(0).expand(N, -1, -1)
+        combined = torch.cat([robot_expanded, task_expanded], dim=2)
+        scores = self.mlp(combined.reshape(-1, H + D))
+        scores = scores.reshape(N, M)
+        scores = torch.clamp(scores, -10.0, 10.0)
+        scores = scores - scores.max(dim=1, keepdim=True)[0]
+        if c_episode is not None:
+            current_temp = max(self.temperature * (1.0 - c_episode / self.num_episodes), 0.1)
+        else:
+            current_temp = self.temperature
+        task_probs = F.softmax(scores / current_temp, dim=1)
+        task_probs = torch.clamp(task_probs, 1e-6, 1.0 - 1e-6)
+        return task_probs
+
+class RobotTaskPolicy(torch.nn.Module):
+    def __init__(self, robot_dim, task_dim, edge_dim, gnn_hidden, mlp_hidden, num_tasks, num_gnn_layers=3):
+        super(RobotTaskPolicy, self).__init__()
+        self.robot_proj = torch.nn.Linear(robot_dim, gnn_hidden)
+        self.task_proj = torch.nn.Linear(task_dim, gnn_hidden)
+        self.gnn_layers = torch.nn.ModuleList([
+            EnhancedBipartiteGNNLayer(
+                robot_dim=gnn_hidden,
+                task_dim=gnn_hidden,
+                edge_dim=edge_dim,
+                hidden_dim=gnn_hidden,
+                dropout=0.0
+            ) for _ in range(num_gnn_layers)
+        ])
+        self.skip_connections = torch.nn.ModuleList([
+            torch.nn.Linear(gnn_hidden, gnn_hidden)
+            for _ in range(max(0, num_gnn_layers - 1))
+        ])
+        self.task_selector = TaskSelectionMLP(
+            robot_hidden_dim=gnn_hidden,
+            task_dim=gnn_hidden,
+            num_tasks=num_tasks,
+            mlp_hidden=mlp_hidden,
+            num_episodes=1000
+        )
+        self.num_gnn_layers = num_gnn_layers
+    def forward(self, x_robot, x_task, edge_index, edge_attr, episode):
+        robot_hidden = self.robot_proj(x_robot)
+        task_hidden = self.task_proj(x_task)
+        layer_outputs = [robot_hidden]
+        for i in range(self.num_gnn_layers):
+            new_robot_hidden, _ = self.gnn_layers[i](robot_hidden, task_hidden, edge_index, edge_attr)
+            if i > 0 and i < len(self.skip_connections) + 1:
+                skip_input = layer_outputs[max(0, i - 2)]
+                new_robot_hidden = new_robot_hidden + self.skip_connections[i - 1](skip_input)
+            robot_hidden = robot_hidden + new_robot_hidden
+            layer_outputs.append(robot_hidden)
+        return self.task_selector(robot_hidden, task_hidden, c_episode=episode)
+
+
 
 def build_bipartite_graph(robots, tasks, matrix):
-    """
-    构建二分图，将机器人和任务转化为图的两类顶点。
+    H, W = len(matrix), len(matrix[0])
+    max_dist = sqrt(H*H + W*W)
 
-    Args:
-        robots (list[tuple[int, int]]): 机器人坐标列表 [(y1, x1), (y2, x2), ...]。
-        tasks (list[tuple[int, int]]): 任务目标坐标列表 [(y1, x1), (y2, x2), ...]。
-        matrix (list[list[int]]): 地图矩阵。
+    robot_features = torch.tensor(robots, dtype=torch.float32)
+    task_features  = torch.tensor(tasks,  dtype=torch.float32)
+    # 归一化坐标 -> [0,1]
+    robot_features /= torch.tensor([H, W], dtype=torch.float32)
+    task_features  /= torch.tensor([H, W], dtype=torch.float32)
 
-    Returns:
-        Data: PyTorch Geometric 的图数据对象。
-    """
-    num_robots = len(robots)
-    num_tasks = len(tasks)
-
-    # 顶点特征：机器人和任务的坐标
-    robot_features = torch.tensor(robots, dtype=torch.float)  # 机器人节点特征
-    task_features = torch.tensor(tasks, dtype=torch.float)    # 任务节点特征
-
-    # 边的起点和终点
     edge_index = []
     edge_features = []
+    for i,(ry,rx) in enumerate(robots):
+        for j,(ty,tx) in enumerate(tasks):
+            man = abs(ry-ty)+abs(rx-tx)
+            _,act = astar_shortest_path_four(matrix,(ry,rx),(ty,tx))
+            if act<0: continue
+            # 归一化距离
+            edge_features.append([man/max_dist, act/max_dist, ((act-man)/max_dist)])
+            edge_index.append([i,j])
 
-    for i, robot in enumerate(robots):
-        for j, task in enumerate(tasks):
-            # 计算边特征
-            manhattan_distance = abs(robot[0] - task[0]) + abs(robot[1] - task[1])
-            path, actual_distance = astar_shortest_path_four(matrix, robot, task)
-            if actual_distance == -1:  # 如果路径不可达，跳过
-                continue
-            priority = 1  # 假设任务优先级为 1，可根据实际情况调整
-            difficulty = (actual_distance - manhattan_distance) / priority
-
-            # 添加边
-            edge_index.append([i, j])  # 从机器人到任务
-            edge_features.append([manhattan_distance,actual_distance,difficulty])
-
-    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()  # 转置为 [2, num_edges]
-    edge_features = torch.tensor(edge_features, dtype=torch.float)
-
-    # 合并节点特征
-    x = torch.cat([robot_features, task_features], dim=0)
-
-    # 构建 PyTorch Geometric 的图数据对象
-    
+    edge_index   = torch.tensor(edge_index,dtype=torch.long).t().contiguous()
+    edge_features= torch.tensor(edge_features,dtype=torch.float32)
     return robot_features, task_features, edge_index, edge_features
 
 def assign_tasks_based_on_probability(task_probs, robots, tasks):
@@ -647,181 +675,73 @@ def calculate_total_cost_from_assignment(start_goal_pairs, matrix, verbose=False
     total_cost = calculate_total_cost(agent_paths)
     return total_cost
 
-def train_with_policy_gradient(num_episodes=1000, learning_rate=0.001, save_interval=100, 
-                               batch_size=5, entropy_coef=0.01, checkpoint_path=None,seed=42):
+def calculate_normalized_advantage(batch_advantages, advantage):
     """
-    使用策略梯度训练任务分配模型
+    增强版优势归一化计算，提高训练稳定性
     
     参数:
-    - num_episodes: 训练回合数
-    - learning_rate: 学习率
-    - save_interval: 保存模型的间隔
-    - batch_size: 批处理大小，每隔多少个样本更新一次
-    - entropy_coef: 熵正则化系数
-    - checkpoint_path: 检查点路径，用于继续训练
+    - batch_advantages: 批次内所有优势值列表
+    - advantage: 当前需要归一化的优势值
     
     返回:
-    - model: 训练好的模型
-    - history: 训练历史记录
+    - normalized_advantage: 归一化后的优势值
     """
-    # 设置随机种子
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-    # 初始化模型和优化器
-    robot_dim=2
-    task_dim=2
-    edge_dim=3
-    hidden_dim=32
-    gnn_hidden=32
-    mlp_hidden=128
-    num_tasks=20
-    
-    model = RobotTaskPolicy(
-        robot_dim=robot_dim,
-        task_dim=task_dim,
-        edge_dim=edge_dim,
-        gnn_hidden=gnn_hidden,
-        mlp_hidden=mlp_hidden,
-        num_tasks=num_tasks
-    )
-    
-    # 1. 从检查点恢复训练
-    start_episode = 0
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        start_episode = checkpoint['episode'] + 1
-        history = checkpoint['history']
-        best_advantage = checkpoint.get('best_advantage', float('-inf'))
-        print(f"从检查点恢复训练，从第 {start_episode} 回合开始")
+    # 使用非零最小标准差确保稳定性
+    if len(batch_advantages) >= 5:  # 增加最小样本要求
+        adv_mean = np.mean(batch_advantages)
+        adv_std = max(np.std(batch_advantages) + 1e-8, 0.5)  # 增加最小标准差
+        normalized_advantage = (advantage - adv_mean) / adv_std
     else:
-        history = {"rewards": [], "costs": [], "advantages": [], "entropies": []}
-        best_advantage = float('-inf')
+        # 样本不足时使用原始值除以常数进行归一化
+        normalized_advantage = advantage / 1000.0
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # 使用更严格的裁剪限制
+    return torch.clamp(torch.tensor(normalized_advantage, dtype=torch.float32), -1.0, 1.0)
+
+def adaptive_entropy_coefficient(episode, base_coef=0.01, min_coef=0.001, decay_factor=0.995):
+    """
+    自适应熵系数调整函数
     
-    # 3. 动态学习率
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.9)
+    参数:
+    - episode: 当前训练回合
+    - base_coef: 基础熵系数
+    - min_coef: 最小熵系数
+    - decay_factor: 衰减因子
     
-    # 如果从检查点恢复，也恢复优化器状态
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-    # 批处理变量
-    batch_policy_losses = []
-    batch_entropies = []
+    返回:
+    - current_entropy_coef: 当前适用的熵系数
+    """
+    # 训练早期使用更大的熵系数鼓励探索
+    if episode < 1000:
+        return max(base_coef * (decay_factor ** (episode / 10)), min_coef)
+    # 训练中期适度探索
+    elif episode < 10000:
+        return max(base_coef * (decay_factor ** (episode / 50)), min_coef)
+    # 训练后期减小探索
+    else:
+        return min_coef
+
+def calculate_optimal_learning_rate(episode, warmup_episodes, min_lr, max_lr):
+    """
+    计算优化的学习率，使用平滑的预热曲线
     
-    # 训练循环
-    for episode in range(start_episode, num_episodes):
-        # 重置环境
-        robots = []
-        tasks = []
-        matrix = read_matrix_from_file("/home/uio/EECBS/map_matrix.txt")
-        free_points = find_free_points(matrix)
-        start_goal_pairs = assign_start_and_goal_points(free_points, 20)
-        for start, goal in start_goal_pairs:
-            robots.append(start)
-            tasks.append(goal)
-            
-        # 计算匈牙利算法的基准成本
-        cost_matrix = np.zeros((len(robots), len(tasks)))
-        for i, robot in enumerate(robots):
-            for j, task in enumerate(tasks):
-                _, cost = astar_shortest_path(matrix, robot, task)
-                cost_matrix[i][j] = cost if cost > 0 else 1e9
-
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
-        hungarian_pairs = [(robots[i], tasks[j]) for i, j in zip(row_ind, col_ind)]
-        hungarian_cost = calculate_total_cost_from_assignment(hungarian_pairs, matrix, verbose=False)
-
-        # 构建图
-        robot_features, task_features, edge_index, edge_features = build_bipartite_graph(robots, tasks, matrix)
-        
-        # 前向传播获取任务选择概率
-        task_probs = model(robot_features, task_features, edge_index, edge_features)
-        
-        # 2. 计算策略熵
-        entropy = -(task_probs * torch.log(task_probs + 1e-10)).sum(dim=1).mean()
-        batch_entropies.append(entropy)
-        
-        # 保存动作的对数概率，用于计算梯度
-        assignments = assign_tasks_based_on_probability(task_probs, robot_features, task_features)
-        log_probs = []
-        for robot_idx, task_idx, _, _, _ in assignments:
-            log_probs.append(torch.log(task_probs[robot_idx, task_idx]))
-        
-
-        _, start_goal_pairs = print_assignments(task_probs, robot_features, task_features, verbose=False)
-        current_cost = calculate_total_cost_from_assignment(start_goal_pairs, matrix, verbose=False)
-        advantage_ratio = min(0.5 + episode / num_episodes * 0.5, 1.0)
-        advantage = hungarian_cost - current_cost  # 正值表示我们的方案优于匈牙利算法
-        
-        # 计算策略损失
-        episode_policy_loss = []
-        for log_prob in log_probs:
-            episode_policy_loss.append(-log_prob * advantage * advantage_ratio)
-        episode_policy_loss = torch.stack(episode_policy_loss).sum()
-        
-        # 加入熵正则化
-        loss = episode_policy_loss - entropy_coef * entropy
-        batch_policy_losses.append(loss)
-        
-        # 1. 批量处理：累积指定批量后更新
-        if len(batch_policy_losses) >= batch_size or episode == num_episodes - 1:
-            optimizer.zero_grad()
-            total_loss = torch.stack(batch_policy_losses).sum()
-            total_loss.backward()
-            optimizer.step()
-            # 3. 更新学习率
-            scheduler.step()
-            batch_policy_losses = []
-            batch_entropies = []
-            
-
-        
-        # 记录训练数据
-        history["rewards"].append(-current_cost)
-        history["costs"].append(current_cost)
-        history["advantages"].append(advantage)
-        history["entropies"].append(entropy.item())
-        
-        # 保存表现最好的模型
-        if advantage > best_advantage:
-            best_advantage = advantage
-            checkpoint = {
-                'episode': episode,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_advantage': best_advantage,
-                'history': history,
-                'scheduler_state_dict': scheduler.state_dict()
-            }
-            torch.save(checkpoint, "best_model_checkpoint.pth")
-            print(f"Episode {episode+1}: 保存最佳模型，优势: {advantage:.2f}")
-            
-        # 定期保存检查点
-        if (episode + 1) % save_interval == 0:
-            checkpoint = {
-                'episode': episode,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_advantage': best_advantage,
-                'history': history,
-                'scheduler_state_dict': scheduler.state_dict()
-            }
-            torch.save(checkpoint, f"checkpoint_episode_{episode+1}.pth")
-            
-        # 打印训练进度
-        if (episode + 1) % 10 == 0:
-            print(f"Episode {episode+1}/{num_episodes}, Cost: {current_cost}, " 
-                  f"Hungarian: {hungarian_cost}, Advantage: {advantage:.2f}, "
-                  f"Entropy: {entropy.item():.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
-
-    return model, history
+    参数:
+    - episode: 当前训练回合
+    - warmup_episodes: 预热期回合数
+    - min_lr: 最小学习率
+    - max_lr: 最大学习率
+    
+    返回:
+    - current_lr: 当前应用的学习率
+    """
+    if episode < warmup_episodes:
+        # 使用更平缓的预热曲线(余弦预热)
+        progress = episode / warmup_episodes
+        curr_lr = min_lr + (max_lr - min_lr) * (np.sin((progress - 0.5) * np.pi) / 2 + 0.5)
+    else:
+        # 预热期结束后使用最大学习率
+        curr_lr = max_lr
+    return curr_lr
 
 def continue_training_from_checkpoint(checkpoint_path, additional_episodes=500):
     """
@@ -839,53 +759,398 @@ def continue_training_from_checkpoint(checkpoint_path, additional_episodes=500):
     episode = checkpoint['episode']
     total_episodes = episode + 1 + additional_episodes
     
-    return train_with_policy_gradient(
+    return train_with_consistent_batch_tasks(
         num_episodes=total_episodes, 
         checkpoint_path=checkpoint_path,
         save_interval=100
     )
 
-def plot_training_history(history):
-    plt.figure(figsize=(15, 10))
+def calculate_normalized_advantage(raw_advantage, baseline, batch_advantages, baseline_alpha=0.9):
+    """优化的优势计算函数 - 保持梯度流版本"""
+    # 保存真实优势值用于显示和分析
+    debug_adv = raw_advantage
     
-    plt.subplot(2, 2, 1)
-    plt.plot(history["rewards"])
-    plt.title("奖励变化")
+    # 将原始优势值转为tensor并裁剪
+    raw_advantage_tensor = torch.tensor(raw_advantage, dtype=torch.float32)
     
-    plt.subplot(2, 2, 2)
-    plt.plot(history["costs"])
-    plt.title("成本变化")
+    # 更新基线值 - 在计算图外更新基线（基线通常不需要梯度）
+    if baseline is None:
+        baseline = raw_advantage
+    else:
+        baseline = baseline_alpha * baseline + (1 - baseline_alpha) * raw_advantage
     
-    plt.subplot(2, 2, 3)
-    plt.plot(history["advantages"])
-    plt.title("优势值变化")
+    # 计算优势(原始优势 - 基线)，保持tensor形式
+    advantage_value = raw_advantage - baseline
     
-    plt.subplot(2, 2, 4)
-    plt.plot(history["entropies"])
-    plt.title("策略熵变化")
+    # 记录到批次优势列表(使用实际值)
+    batch_advantages.append(advantage_value)
     
-    plt.tight_layout()
-    plt.savefig("training_history.png")
-    plt.show()
+    # 归一化优势计算
+    if len(batch_advantages) >= 5:
+        adv_mean = np.mean(batch_advantages)
+        # 增加最小标准差，避免归一化到接近0
+        adv_std = max(np.std(batch_advantages), 10.0)
+        normalized_advantage = (advantage_value - adv_mean) / adv_std
+    else:
+        normalized_advantage = advantage_value / 50.0
     
+    # 将归一化优势转为tensor并适当裁剪
+    normalized_advantage_tensor = torch.clamp(
+        torch.tensor(normalized_advantage, dtype=torch.float32), 
+        -2.0, 2.0
+    )
+    
+    return normalized_advantage_tensor, debug_adv, advantage_value, baseline
+
+def sample_tasks_differentiable(task_probs, robots, tasks):
+    """使用PyTorch的可微分采样进行任务分配，保持计算图完整"""
+    num_robots, num_tasks = task_probs.shape
+    
+    # 初始化结果列表和对数概率列表
+    assignments = []
+    log_probs = []
+    
+    # 未分配的机器人和任务集合
+    unassigned_robots = set(range(num_robots))
+    unassigned_tasks = set(range(min(num_robots, num_tasks)))
+    
+    # 一对一分配过程
+    while unassigned_robots and unassigned_tasks:
+        # 构建当前未分配的子概率矩阵
+        current_robot_indices = list(unassigned_robots)
+        current_task_indices = list(unassigned_tasks)
+        
+        # 创建掩码后的概率矩阵
+        masked_probs = torch.zeros_like(task_probs)
+        for r_idx in current_robot_indices:
+            for t_idx in current_task_indices:
+                masked_probs[r_idx, t_idx] = task_probs[r_idx, t_idx]
+        
+        # 归一化
+        sum_probs = masked_probs.sum() + 1e-10
+        robot_task_probs = masked_probs / sum_probs
+        
+        # 展平概率
+        flat_probs = robot_task_probs.reshape(-1)
+        
+        # 使用PyTorch的Categorical分布进行可微分采样
+        distribution = torch.distributions.Categorical(probs=flat_probs)
+        flat_action = distribution.sample()  # 保持计算图连接的采样
+        
+        # 计算对数概率（保持梯度流）
+        action_log_prob = distribution.log_prob(flat_action)
+        
+        # 分离动作索引（这里需要分离，但保存了计算图中的log_prob）
+        flat_action_idx = flat_action.item()  # 只有在这里使用item()，之前已保存了梯度信息
+        robot_idx, task_idx = divmod(flat_action_idx, num_tasks)
+        
+        # 添加对数概率到列表，这里保持了梯度流
+        log_probs.append(action_log_prob)
+        
+        # 只处理有效分配（概率不为零）
+        if masked_probs[robot_idx, task_idx] > 0:
+            assignments.append((
+                robot_idx, 
+                task_idx, 
+                robots[robot_idx], 
+                tasks[task_idx]
+            ))
+            
+            # 从未分配集合中移除
+            if robot_idx in unassigned_robots:
+                unassigned_robots.remove(robot_idx)
+            if task_idx in unassigned_tasks:
+                unassigned_tasks.remove(task_idx)
+    
+    return assignments, log_probs
+
+def calculate_entropy(probs):
+    """计算策略熵"""
+    # 更严格的裁剪，确保概率值在安全范围内
+    safe_probs = torch.clamp(probs, 1e-7, 1.0 - 1e-7)
+    log_probs = torch.log(safe_probs)
+    # 计算熵并处理可能的NaN值
+    entropy = -(safe_probs * log_probs).sum(dim=1).mean()
+    if torch.isnan(entropy):
+        print(f"警告: 检测到熵为NaN，使用默认值0.0")
+        return torch.tensor(0.0)
+    return entropy
+
+def convert_assignments_to_pairs(assignments):
+    """将分配结果转换为起点终点对"""
+    start_goal_pairs = []
+    for robot_idx, task_idx, robot_pos, task_pos in assignments:
+        if isinstance(robot_pos, torch.Tensor):
+            start = (int(robot_pos[0].item()), int(robot_pos[1].item()))
+        else:
+            start = (int(robot_pos[0]), int(robot_pos[1]))
+            
+        if isinstance(task_pos, torch.Tensor):
+            goal = (int(task_pos[0].item()), int(task_pos[1].item()))
+        else:
+            goal = (int(task_pos[0]), int(task_pos[1]))
+            
+        start_goal_pairs.append((start, goal))
+    
+    return assignments, start_goal_pairs
+
+def gumbel_softmax_sample(logits, tau=1.0, hard=False):
+    """Gumbel-Softmax采样，返回[N, M]软分配矩阵"""
+    gumbels = -torch.empty_like(logits).exponential_().log()
+    y = (logits + gumbels) / tau
+    y_soft = F.softmax(y, dim=-1)
+    if hard:
+        index = y_soft.max(dim=-1, keepdim=True)[1]
+        y_hard = torch.zeros_like(y_soft).scatter_(-1, index, 1.0)
+        return (y_hard - y_soft).detach() + y_soft
+    else:
+        return y_soft
+
+def soft_assignment_cost(assign_matrix, cost_matrix):
+    """根据软分配矩阵和代价矩阵计算soft cost"""
+    # assign_matrix: [N, M], cost_matrix: [N, M]
+    return (assign_matrix * cost_matrix).sum()
+
+def train_with_consistent_batch_tasks(
+    num_episodes=1000, learning_rate=0.0001, save_interval=100,
+    batch_size=50, entropy_coef=0.05, checkpoint_path=None,
+    weight_decay=5e-4, seed=42, grad_accum_steps=8
+):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    matrix = read_matrix_from_file("/home/uio/EECBS/map_matrix.txt")
+    robot_dim = 2
+    task_dim = 2
+    edge_dim = 3
+    num_tasks = 20
+    model = RobotTaskPolicy(
+        robot_dim=robot_dim,
+        task_dim=task_dim,
+        edge_dim=edge_dim,
+        gnn_hidden=64,
+        mlp_hidden=256,
+        num_tasks=num_tasks,
+        num_gnn_layers=3
+    )
+    start_episode = 0
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        start_episode = checkpoint['episode'] + 1
+        history = checkpoint['history']
+        best_advantage = checkpoint.get('best_advantage', float('-inf'))
+        print(f"从检查点恢复训练，从第 {start_episode} 回合开始")
+    else:
+        history = {"rewards": [], "costs": [], "advantages": [], "entropies": []}
+        best_advantage = float('-inf')
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=max(2, num_episodes // batch_size * 2),
+        T_mult=2,
+        eta_min=1e-5
+    )
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    baseline = 0
+    baseline_alpha = 0.95
+    warmup_episodes = 100
+    min_lr = learning_rate * 0.2
+    max_lr = learning_rate
+    for batch_start in range(start_episode, num_episodes, batch_size):
+        robots = []
+        tasks = []
+        free_points = find_free_points(matrix)
+        start_goal_pairs = assign_start_and_goal_points(free_points, 20)
+        for start, goal in start_goal_pairs:
+            robots.append(start)
+            tasks.append(goal)
+        cost_matrix = np.zeros((len(robots), len(tasks)))
+        for i, robot in enumerate(robots):
+            for j, task in enumerate(tasks):
+                _, cost = astar_shortest_path(matrix, robot, task)
+                cost_matrix[i][j] = cost if cost > 0 else 1e9
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        hungarian_pairs = [(robots[i], tasks[j]) for i, j in zip(row_ind, col_ind)]
+        hungarian_cost = calculate_total_cost_from_assignment(hungarian_pairs, matrix, verbose=False)
+        robot_features, task_features, edge_index, edge_features = build_bipartite_graph(robots, tasks, matrix)
+        batch_policy_losses = []
+        batch_entropies = []
+        batch_advantages = []
+        batch_assignments = []
+        optimizer.zero_grad()
+        batch_end = min(batch_start + batch_size, num_episodes)
+        for episode in range(batch_start, batch_end):
+            # 学习率warmup
+            if episode < warmup_episodes:
+                progress = episode / warmup_episodes
+                curr_lr = min_lr + (max_lr - min_lr) * (np.sin((progress - 0.5) * np.pi) / 2 + 0.5)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = curr_lr
+            # 增强探索：训练初期加噪声
+            task_probs = model(robot_features, task_features, edge_index, edge_features, episode)  # [N, M]
+            if episode < 5000:
+                task_probs = task_probs + torch.randn_like(task_probs) * 0.05
+                task_probs = torch.clamp(task_probs, 1e-6, 1.0 - 1e-6)
+                task_probs = task_probs / task_probs.sum(dim=1, keepdim=True)
+            # 自适应熵系数
+            entropy_coef = max(entropy_coef * (0.999 ** (episode // 100)), 0.01)
+            # --- 严格RL动作采样 ---
+            m = torch.distributions.Categorical(probs=task_probs)
+            actions = m.sample()  # [N]
+            log_probs = m.log_prob(actions)  # [N]
+            entropy = m.entropy().mean()
+            # 构造 one-hot 分配矩阵
+            assign_matrix = torch.zeros_like(task_probs)
+            assign_matrix[torch.arange(len(actions)), actions] = 1.0
+            torch_cost_matrix = torch.tensor(cost_matrix, dtype=torch.float32)
+            current_cost = soft_assignment_cost(assign_matrix, torch_cost_matrix)
+            # 优化reward
+            reward = -(current_cost - hungarian_cost) / (hungarian_cost + 1e-6)
+            # 基线更新
+            if baseline is None:
+                baseline = reward.item()
+            else:
+                baseline = baseline_alpha * baseline + (1 - baseline_alpha) * reward.item()
+            advantage = reward - baseline
+            batch_advantages.append(advantage.item())
+            # 归一化优势
+            if len(batch_advantages) >= 5:
+                adv_mean = np.mean(batch_advantages)
+                adv_std = max(np.std(batch_advantages), 0.5)
+                normalized_advantage = (advantage.item() - adv_mean) / adv_std
+            else:
+                normalized_advantage = advantage.item() / 10.0
+            normalized_advantage = torch.clamp(torch.tensor(normalized_advantage, dtype=torch.float32), -2.0, 2.0)
+            # policy loss（严格RL）
+            policy_loss = -normalized_advantage * log_probs.sum()
+            # imitation loss 可选
+            if episode % 5 == 0:
+                probs = task_probs.detach().cpu().numpy()
+                row_ind, col_ind = linear_sum_assignment(-probs)
+                hungarian_label = np.zeros_like(probs)
+                hungarian_label[row_ind, col_ind] = 1
+                hungarian_label = torch.tensor(hungarian_label, dtype=task_probs.dtype, device=task_probs.device)
+                imitation_loss = F.binary_cross_entropy(task_probs, hungarian_label)
+                loss = policy_loss - entropy_coef * entropy + 5.0 * imitation_loss
+            else:
+                loss = policy_loss - entropy_coef * entropy
+            scaled_loss = loss / grad_accum_steps
+            scaled_loss.backward()
+            # 梯度异常检查
+            for name, param in model.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    print(f"警告: {name} 梯度出现NaN")
+            should_update = ((episode - batch_start + 1) % grad_accum_steps == 0) or (episode == batch_end - 1)
+            if should_update:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+            history["rewards"].append(reward.item())
+            history["costs"].append(current_cost.item())
+            history["advantages"].append(advantage.item())
+            history["entropies"].append(entropy.item())
+            batch_entropies.append(entropy.item())
+            if advantage.item() > best_advantage:
+                best_advantage = advantage.item()
+                checkpoint = {
+                    'episode': episode,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_advantage': best_advantage,
+                    'history': history,
+                    'scheduler_state_dict': scheduler.state_dict()
+                }
+                torch.save(checkpoint, "best_model_checkpoint.pth")
+                print(f"Episode {episode+1}: 保存最佳模型，优势: {advantage.item():.2f}")
+            if (episode + 1) % save_interval == 0:
+                checkpoint = {
+                    'episode': episode,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_advantage': best_advantage,
+                    'history': history,
+                    'scheduler_state_dict': scheduler.state_dict()
+                }
+                torch.save(checkpoint, f"checkpoint_episode_{episode+1}.pth")
+            if (episode + 1) % 5 == 0:
+                print(
+                    f"回合 {episode+1}/{num_episodes} | "
+                    f"匈牙利算法成本: {hungarian_cost:.2f} | "
+                    f"GNN模型成本: {current_cost.item():.2f} | "
+                    f"奖励: {reward.item():.4f} | "
+                    f"归一化优势: {normalized_advantage.item():.4f} | "
+                    f"熵: {entropy.item():.4f} | "
+                    f"熵系数: {entropy_coef:.6f} | "
+                    f"学习率: {optimizer.param_groups[0]['lr']:.6f} | "
+                    f"基线: {baseline:.2f}"
+                )
+        if len(batch_advantages) > 0:
+            best_batch_advantage = max(batch_advantages)
+            avg_batch_advantage = sum(batch_advantages) / len(batch_advantages)
+            avg_entropy = sum(batch_entropies) / len(batch_entropies) if len(batch_entropies) > 0 else 0.0
+            print(
+                f"批次{batch_start//batch_size + 1} | "
+                f"最佳优势值: {best_batch_advantage:.2f} | "
+                f"平均优势值: {avg_batch_advantage:.2f} | "
+                f"平均熵值: {avg_entropy:.4f} | "
+                f"累计进度: {(batch_end/num_episodes)*100:.2f}%"
+            )
+        scheduler.step()
+        batch_advantages.clear()
+        batch_entropies.clear()
+    return model, history
+
+
 if __name__ == "__main__":
-    # 从零开始训练
-    # train_with_policy_gradient(num_episodes=1000, batch_size=5, entropy_coef=0.01)
+    # 修改训练参数
+    model, history = train_with_consistent_batch_tasks(
+        num_episodes=10000, 
+        learning_rate=0.0005,     # 提高基础学习率
+        save_interval=100, 
+        batch_size=1280,           # 更合理的批大小
+        entropy_coef=0.05,        # 增加初始探索系数
+        weight_decay=5e-5,        # 减少权重衰减
+        seed=42,
+        grad_accum_steps=2        # 减少累积步数提高更新频率
+    )
     
-    # 或者从检查点继续训练
-    # continue_training_from_checkpoint("checkpoint_episode_500.pth", additional_episodes=500)
-    
-    # 默认训练
-    model, history = train_with_policy_gradient()
-    # 然后单独保存历史记录
+    # 保存训练结果
     torch.save(history, "training_history.pth")
-    # 保存模型参数（推荐用于部署）
     torch.save(model.state_dict(), "final_model_params.pth")
     print("模型参数已保存至 final_model_params.pth")
-    # 保存完整模型（包括架构）
     torch.save(model, "full_model.pth")
     print("完整模型已保存至 full_model.pth")
-        
-
-
-
+    
+    # 绘制训练曲线
+    plt.figure(figsize=(16, 8))
+    plt.subplot(2, 2, 1)
+    plt.plot(history["rewards"])
+    plt.title("奖励曲线")
+    plt.xlabel("回合")
+    plt.ylabel("奖励值")
+    
+    plt.subplot(2, 2, 2)
+    plt.plot(history["advantages"])
+    plt.title("优势值曲线")
+    plt.xlabel("回合")
+    plt.ylabel("优势值")
+    
+    plt.subplot(2, 2, 3)
+    plt.plot(history["entropies"])
+    plt.title("熵值曲线")
+    plt.xlabel("回合")
+    plt.ylabel("熵")
+    
+    plt.subplot(2, 2, 4)
+    plt.plot(history["costs"])
+    plt.title("成本曲线")
+    plt.xlabel("回合")
+    plt.ylabel("路径成本")
+    
+    plt.tight_layout()
+    plt.savefig("training_curves.png")
+    print("训练曲线已保存至 training_curves.png")
